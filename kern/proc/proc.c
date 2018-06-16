@@ -49,8 +49,9 @@
 #include <vnode.h>
 #include <vfs.h>
 #include <synch.h>
-#include <kern/fcntl.h>  
-
+#include <kern/fcntl.h>
+#include "opt-A2.h"
+#include <limits.h>
 /*
  * The process for the kernel; this holds all the kernel-only threads.
  */
@@ -69,7 +70,34 @@ static struct semaphore *proc_count_mutex;
 struct semaphore *no_proc_sem;   
 #endif  // UW
 
+#if OPT_A2
+bool occupied[PID_MAX+1];
+struct lock *pid_lk;
 
+bool 
+proc_exist(pid_t pid)
+{
+	if (pid < PID_MIN || pid > PID_MAX) {
+		return false;
+	}
+	if (!occupied[pid]) {
+		return false;
+	}
+	return true;
+}
+
+struct proc *
+get_child_proc(struct proc *proc, pid_t pid)
+{
+	for (unsigned int i = 0; i < array_num(proc->p_children); i++) {
+		struct proc *cProc = array_get(proc->p_children, i);
+		if (cProc->p_id == pid) {
+			return cProc;
+		}
+	}
+	return NULL;
+}
+#endif /* OPT_A2 */
 
 /*
  * Create a proc structure.
@@ -102,6 +130,52 @@ proc_create(const char *name)
 #ifdef UW
 	proc->console = NULL;
 #endif // UW
+
+#if OPT_A2
+	proc->p_exitcode = 0;
+	proc->p_dead = false;
+	proc->p_parent = NULL;
+
+	proc->p_lk = lock_create("p_lk");
+	if (proc->p_lk == NULL) {
+		kfree(proc->p_name);
+		kfree(proc);
+    	return NULL;
+	}
+
+	proc->p_cv = cv_create("p_cv");
+	if (proc->p_lk == NULL) {
+		kfree(proc->p_name);
+		kfree(proc->p_lk);
+		kfree(proc);
+    	return NULL;
+	}
+	
+	proc->p_children = array_create();
+	array_init(proc->p_children);
+	if (proc->p_children == NULL) {
+		kfree(proc->p_name);
+		kfree(proc->p_lk);
+		kfree(proc->p_cv);
+		kfree(proc);
+    	return NULL;
+	}
+
+	bool success_pid = false;
+	//lock_acquire(pid_lk);
+	for (int i = PID_MIN; i <= PID_MAX; i++) {
+		if (!occupied[i]){
+			occupied[i] = true;
+			proc->p_id = i;
+			success_pid = true;
+			break;
+		}
+	}
+	//lock_release(pid_lk);
+	if (!success_pid){
+		proc->p_id = -1;
+	}
+#endif /* OPT_A2 */
 
 	return proc;
 }
@@ -166,6 +240,50 @@ proc_destroy(struct proc *proc)
 	threadarray_cleanup(&proc->p_threads);
 	spinlock_cleanup(&proc->p_lock);
 
+#if OPT_A2
+	KASSERT(proc->p_lk != NULL);
+	KASSERT(proc->p_cv != NULL);
+	KASSERT(proc->p_children != NULL);
+
+	/*
+	struct array *dead_children = array_create();
+	array_init(dead_children);
+	*/
+
+	for (unsigned int i = array_num(proc->p_children); i > 0; i--) {
+		struct proc *cProc = array_get(proc->p_children,i-1);
+		if(cProc->p_dead) {
+			KASSERT(cProc != NULL);
+			array_remove(proc->p_children,i-1);
+
+			//array_add(dead_children,cProc,NULL);
+
+			proc_destroy(cProc);
+		}
+		else {
+			lock_acquire(cProc->p_lk);
+			cProc->p_parent = NULL;
+			lock_release(cProc->p_lk);
+			array_remove(proc->p_children,i-1);
+		}
+	}
+	/*
+	for (unsigned int j = array_num(dead_children); i > 0; i--) {
+		struct proc *dead_child = array_get(proc->p_children,i-1);
+		array_remove(dead_children, i-1);
+		proc_destroy(dead_child);
+	}
+	array_destroy(dead_children);
+	*/
+	lock_destroy(proc->p_lk);
+	cv_destroy(proc->p_cv);
+	array_destroy(proc->p_children);
+	
+	lock_acquire(pid_lk);
+	occupied[proc->p_id] = false;
+	lock_release(pid_lk);
+#endif /* OPT_A2 */
+
 	kfree(proc->p_name);
 	kfree(proc);
 
@@ -183,8 +301,6 @@ proc_destroy(struct proc *proc)
 	}
 	V(proc_count_mutex);
 #endif // UW
-	
-
 }
 
 /*
@@ -193,6 +309,16 @@ proc_destroy(struct proc *proc)
 void
 proc_bootstrap(void)
 {
+#if OPT_A2
+  for (int i = PID_MIN; i <= PID_MAX; i++) {
+  	occupied[i] = false;
+  }
+  pid_lk = lock_create("pid_lk");
+  if(pid_lk == NULL) {
+  	panic("lock was not created unfortunately\n");
+  }
+#endif /* OPT_A2 */ 
+
   kproc = proc_create("[kernel]");
   if (kproc == NULL) {
     panic("proc_create for kproc failed\n");
