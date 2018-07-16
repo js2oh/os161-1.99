@@ -11,7 +11,9 @@
 #include <copyinout.h>
 #include <synch.h>
 #include <mips/trapframe.h>
+#include <mips/vm.h>
 #include <limits.h>
+#include <test.h>
 #include "opt-A2.h"
 
   /* this implementation of sys__exit does not do anything with the exit code */
@@ -180,7 +182,7 @@ sys_waitpid(pid_t pid,
 }
 
 #if OPT_A2
-pid_t sys_fork(struct trapframe *tf, pid_t *retval) {
+int sys_fork(struct trapframe *tf, pid_t *retval) {
 
   KASSERT(curproc != NULL);
 
@@ -235,4 +237,55 @@ pid_t sys_fork(struct trapframe *tf, pid_t *retval) {
   *retval = cProc->p_id;
   return(0);
 }
+
+int sys_execv(const_userptr_t progname, userptr_t args, int *retval) {
+  int result;
+
+  // Count the number of arguments and copy them into the kernel
+  int argc = 0;
+  size_t tLength;
+  int index = 0;
+  while(((userptr_t *) args)[argc] != NULL) {
+    argc++;
+    tLength += strlen(((char **)args)[index]) + 1;
+  }
+  if (tLength > ARG_MAX) {
+    *retval = -1;
+    return E2BIG;
+  }
+  size_t aLength;
+  char *argv[argc];
+  char cArg[tLength];
+  index = 0;
+  for(int i = 0; i < argc; i++) {
+    size_t mLength = strlen(((char **)args)[i]) + 1;
+    result = copyinstr(((userptr_t *)args)[i], (char *)(cArg + index), mLength, &aLength);
+    if (result) {
+      *retval = -1;
+      return result;
+    }
+    argv[i] = cArg + index;
+    index += aLength;
+  }
+
+  // Copy the program path into the kernel
+  char cPath[PATH_MAX];
+  size_t pLength;
+  result = copyinstr(progname, cPath, PATH_MAX, &pLength);
+  if (result) {
+    *retval = -1;
+    return result;
+  }
+  if (pLength <= 1) {
+    *retval = -1;
+    return ENOENT;
+  }
+
+  // Call runprogram to do the rest of steps
+  result = runprogram(cPath,argv,argc);
+
+  *retval = -1;
+  return result;
+}
+
 #endif /* OPT_A2 */

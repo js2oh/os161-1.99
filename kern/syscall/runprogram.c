@@ -44,6 +44,8 @@
 #include <vfs.h>
 #include <syscall.h>
 #include <test.h>
+#include <copyinout.h>
+#include "opt-A2.h"
 
 /*
  * Load program "progname" and start running it in usermode.
@@ -52,21 +54,24 @@
  * Calls vfs_open on progname and thus may destroy it.
  */
 int
-runprogram(char *progname)
+runprogram(char *progname, char **args, unsigned long argc)
 {
 	struct addrspace *as;
 	struct vnode *v;
-	vaddr_t entrypoint, stackptr;
+	vaddr_t entrypoint, stackptr, argv;
 	int result;
 
 	/* Open the file. */
-	result = vfs_open(progname, O_RDONLY, 0, &v);
+	char *fname_temp;
+	fname_temp = kstrdup(progname);
+	result = vfs_open(fname_temp, O_RDONLY, 0, &v);
+	kfree(fname_temp);
 	if (result) {
 		return result;
 	}
 
 	/* We should be a new process. */
-	KASSERT(curproc_getas() == NULL);
+	// KASSERT(curproc_getas() == NULL);
 
 	/* Create a new address space. */
 	as = as_create();
@@ -76,13 +81,23 @@ runprogram(char *progname)
 	}
 
 	/* Switch to it and activate it. */
+	#if OPT_A2
+	struct addrspace *oldas = curproc_setas(as);
+	#else
 	curproc_setas(as);
+	#endif /* OPT_A2 */
 	as_activate();
 
 	/* Load the executable. */
 	result = load_elf(v, &entrypoint);
 	if (result) {
 		/* p_addrspace will go away when curproc is destroyed */
+		#if OPT_A2
+		as_deactivate();
+    	as = curproc_setas(oldas);
+    	as_destroy(as);
+    	as_activate();
+    	#endif /* OPT_A2 */
 		vfs_close(v);
 		return result;
 	}
@@ -94,15 +109,67 @@ runprogram(char *progname)
 	result = as_define_stack(as, &stackptr);
 	if (result) {
 		/* p_addrspace will go away when curproc is destroyed */
+		#if OPT_A2
+		as_deactivate();
+    	as = curproc_setas(oldas);
+    	as_destroy(as);
+    	as_activate();
+    	#endif /* OPT_A2 */
 		return result;
 	}
 
+	#if OPT_A2
+	// Need to copy the arguments into the new address space
+	char ** argPtr = kmalloc((argc + 1)*sizeof(char *));
+	for (unsigned int i = 0; i < argc; i++) {
+		size_t argLength = strlen(args[i]) + 1;
+		stackptr -= argLength;
+		result = copyout(args[i],(userptr_t)stackptr,argLength);
+		if (result) {
+			as_deactivate();
+    		as = curproc_setas(oldas);
+    		as_destroy(as);
+    		as_activate();
+			kfree(argPtr);
+			return result;
+		}
+		argPtr[i] = (char *)stackptr;
+	}
+	argPtr[argc] = NULL;
+	int pad = stackptr % 4;
+	stackptr -= pad;
+	size_t argPtrLength = (argc + 1) * sizeof(char *);
+	stackptr -= argPtrLength;
+	result = copyout(argPtr,(userptr_t)stackptr,argPtrLength);
+	if (result) {
+		as_deactivate();
+    	as = curproc_setas(oldas);
+    	as_destroy(as);
+    	as_activate();
+		kfree(argPtr);
+		return result;
+	}
+	argv = stackptr;
+	pad = stackptr % 8;
+	stackptr -= pad;
+
+	kfree(argPtr);
+
+	// Delete old address space
+  	as_deactivate();
+  	as_destroy(oldas);
+  	as_activate();
+
+  	/* Warp to user mode. */
+	enter_new_process(argc, (userptr_t)argv,
+			  stackptr, entrypoint);
+	#else
 	/* Warp to user mode. */
 	enter_new_process(0 /*argc*/, NULL /*userspace addr of argv*/,
 			  stackptr, entrypoint);
+	#endif /* OPT_A2 */
 	
 	/* enter_new_process does not return. */
 	panic("enter_new_process returned\n");
 	return EINVAL;
 }
-
