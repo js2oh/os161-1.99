@@ -39,6 +39,11 @@
 #include <vm.h>
 #include <mainbus.h>
 #include <syscall.h>
+#include "opt-A3.h"
+#include <kern/wait.h>
+#include <proc.h>
+#include <addrspace.h>
+#include <synch.h>
 
 
 /* in exception.S */
@@ -107,6 +112,45 @@ kill_curthread(vaddr_t epc, unsigned code, vaddr_t vaddr)
 		sig = SIGFPE;
 		break;
 	}
+
+#if OPT_A3
+	if (code == EX_MOD) {
+		KASSERT(curproc != NULL);
+
+  		struct addrspace *as;
+  		struct proc *p = curproc;
+
+	  	KASSERT(curproc->p_addrspace != NULL);
+	  	as_deactivate();
+	  	/*
+	   	* clear p_addrspace before calling as_destroy. Otherwise if
+	   	* as_destroy sleeps (which is quite possible) when we
+	   	* come back we'll be calling as_activate on a
+	   	* half-destroyed address space. This tends to be
+	   	* messily fatal.
+	   	*/
+	  	as = curproc_setas(NULL);
+	  	as_destroy(as);
+
+	  	/* detach this thread from its process */
+	  	/* note: curproc cannot be used after this call */
+	  	proc_remthread(curthread);
+
+	  	p->p_dead = true;
+	  	p->p_exitcode = _MKWAIT_SIG(sig);
+	  	lock_acquire(p->p_lk);
+	  	cv_broadcast(p->p_cv,p->p_lk);
+	  	lock_release(p->p_lk);
+
+	  	/* if this is the last user process in the system, proc_destroy()
+	    will wake up the kernel menu thread */
+	  	if (p->p_parent == NULL) {
+	    	proc_destroy(p);
+	  	}
+	  
+	  	thread_exit();
+	}
+#endif /* OPT_A3 */
 
 	/*
 	 * You will probably want to change this.
